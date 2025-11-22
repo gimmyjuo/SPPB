@@ -1,208 +1,217 @@
+import pandas as pd
 from neo4j import GraphDatabase
-import ollama
 import sys
+import time
+import ollama
 
-# --- 1. Neo4j 資料庫連線設定 ---
-NEO4J_URI = "bolt://localhost:7687"
+# --- 1. 設定區 ---
+CSV_FILE = "SPPB_秒數輸入測試集.csv"          # 來源檔案
+OUTPUT_FILE = "SPPB_完整測試報告_LLM.csv"    # 輸出檔案
+
+#NEO4J_URI = "bolt://localhost:7687"
+NEO4J_URI = "neo4j+s://58771106.databases.neo4j.io" 
 NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "my-neo4j-SPPB" # !! 您的密碼 !!
+#NEO4J_PASSWORD = "my-neo4j-SPPB"           # !! 請確認密碼 !!
+NEO4J_PASSWORD = "opNmcTLoVU5w4i2zRzDy8ZWDlYmkur2FG76Ipdn_47Q"
+LLM_MODEL = "gemma3:1b"                    # 您的 Ollama 模型名稱
+
+# --- 2. 資料庫與工具函式 ---
 DRIVER = None
 
 def connect_db():
-    """建立 (或重用) 全局的資料庫連線"""
     global DRIVER
     if DRIVER is None:
         try:
             DRIVER = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
             DRIVER.verify_connectivity()
-            print("[KG 連線成功...]")
         except Exception as e:
-            print(f"\n[KG 連線錯誤] 無法連接到 Neo4j 資料庫: {e}", file=sys.stderr)
-            print("請確認您的 Neo4j (SPPB) 實例是否正在 RUNNING 狀態。", file=sys.stderr)
+            print(f"\n[Error] 資料庫連線失敗: {e}")
             sys.exit(1)
     return DRIVER
 
-# --- 2. Neo4j 檢索 (Retrieval) 函式 ---
+def close_db():
+    if DRIVER:
+        DRIVER.close()
 
 def get_score_from_kg(test_name, time_taken):
-    """
-    (RAG 步驟 1)
-    拿「秒數」去 KG 檢索「分數」。
-    """
     driver = connect_db()
-    cypher_query = """
+    cypher = """
     MATCH (r:Rule {for_test: $test_name})
     WHERE r.min_time <= $time AND r.max_time >= $time
     RETURN r.score AS score
     """
-    score = 0
-    with driver.session(database="neo4j") as session:
-        result = session.run(cypher_query, test_name=test_name, time=time_taken)
-        record = result.single()
-        if record:
-            score = record["score"]
-    return score
+    try:
+        with driver.session() as session:
+            result = session.run(cypher, test_name=test_name, time=time_taken)
+            record = result.single()
+            return record["score"] if record else 0
+    except:
+        return 0
 
 def get_meaning_from_kg(test_name, score):
-    """
-    (RAG 步驟 2 - ✨ V5 新增功能 ✨)
-    拿「分數」去 KG 檢索「專業評語 (事實)」。
-    """
     driver = connect_db()
-    cypher_query = """
+    cypher = """
     MATCH (r:Rule {for_test: $test_name, score: $score})
     RETURN r.meaning_ch AS meaning
     """
-    meaning = "N/A" # Default
-    with driver.session(database="neo4j") as session:
-        result = session.run(cypher_query, test_name=test_name, score=score)
-        record = result.single()
-        if record and record["meaning"]:
-            meaning = record["meaning"]
-    return meaning
+    try:
+        with driver.session() as session:
+            result = session.run(cypher, test_name=test_name, score=score)
+            record = result.single()
+            return record["meaning"] if record else ""
+    except:
+        return ""
 
-def get_sppb_interpretation(total_score):
-    """
-    (RAG 步驟 3)
-    拿「總分」去 KG 檢索「總結判讀 (事實)」。
-    """
+def get_interpretation(total_score):
     driver = connect_db()
-    cypher_query = """
+    cypher = """
     MATCH (i:Interpretation)
     WHERE i.min_score <= $score AND i.max_score >= $score
-    RETURN i.meaning_ch AS interpretation
+    RETURN i.meaning_ch AS interp
     """
-    result_meaning = "找不到對應的說明"
-    with driver.session(database="neo4j") as session:
-        result = session.run(cypher_query, score=total_score)
-        record = result.single()
-        if record:
-            result_meaning = record["interpretation"]
-    return result_meaning
+    try:
+        with driver.session() as session:
+            result = session.run(cypher, score=total_score)
+            record = result.single()
+            return record["interp"] if record else ""
+    except:
+        return ""
 
-def close_db_connection():
-    """關閉資料庫連線"""
-    global DRIVER
-    if DRIVER is not None:
-        DRIVER.close()
-        DRIVER = None
-
-# --- 3. LLM 生成 (Generation) 函式 ---
-
-def generate_llm_report(kg_facts):
-    """
-    (RAG 步驟 4 - ✨ V5 核心更新 ✨)
-    將「所有」從 KG 檢索到的「事實」餵給 LLM，
-    並「強制」它只能進行語言組合，不准思考。
-    """
-    print("\n[LLM 正在生成報告...] (根據 KG 事實進行中...)")
+def generate_llm_report(facts):
+    """呼叫 Ollama 生成報告"""
+    prompt = f"""
+    你是一個語言助理，你的任務是將以下「事實清單」組合成一段流暢的繁體中文報告。
+    規則：
+    1. 以「您好」開頭。
+    2. 必須提及所有事實。
+    3. 不得提及「知識圖譜」或「KG」。
+    4. 不得捏造事實。
     
-    # --- 這是 Graph-RAG 最關鍵的「約束提示」(Constrained Prompt) ---
-    prompt_message = f"""
-    你是一個語言助理，你的「唯一」任務是將我提供的「事實清單」組合(拼接)成一段流暢的繁體中文報告。
+    事實清單：
+    * 平衡測試(並排): {facts.get('bal_a_txt', '')}
+    * 平衡測試(半並排): {facts.get('bal_b_txt', '')}
+    * 平衡測試(直線): {facts.get('bal_c_txt', '')}
+    * 步行速度: {facts.get('gait_txt', '')}
+    * 椅子起站: {facts.get('chair_txt', '')}
+    * 總分: {facts.get('total_score', 0)} 分
+    * 總體評估: {facts.get('interp', '')}
     
-    **規則：**
-    1.  以「您好」開頭。
-    2.  必須「依序」提及我提供的所有事實。
-    3.  **絕對禁止** 提及「知識圖譜」或「KG」這幾個字。
-    4.  **絕對禁止** 加入任何「事實清單」中**沒有**的資訊、評語或建議。
-    5.  **絕對禁止** 產生幻覺。
-
-    **【事實清單 (你唯一能用的資料)】：**
-    * 事實 (平衡-並排)： "{kg_facts['balance_side_meaning']}"
-    * 事實 (平衡-半並排)： "{kg_facts['balance_semi_meaning']}"
-    * 事實 (平衡-直線)： "{kg_facts['balance_tandem_meaning']}"
-    * 事實 (步行速度)： "{kg_facts['gait_meaning']}"
-    * 事實 (椅子起站)： "{kg_facts['chair_meaning']}"
-    * 事實 (總分)： "您的 SPPB 總分是：{kg_facts['total_score']} 分"
-    * 事實 (總結)： "根據量表規則，這個分數代表：{kg_facts['interpretation']}"
-    
-    請開始生成報告：
+    請生成報告：
     """
+    try:
+        res = ollama.chat(model=LLM_MODEL, messages=[{'role': 'user', 'content': prompt}], stream=False)
+        return res['message']['content']
+    except Exception as e:
+        return f"[LLM Error] {e}"
+
+def print_progress(iteration, total, prefix='', suffix='', length=40, fill='█'):
+    """繪製進度條"""
+    percent = ("{0:.1f}").format(100 * (iteration / float(total)))
+    filled_length = int(length * iteration // total)
+    bar = fill * filled_length + '-' * (length - filled_length)
+    sys.stdout.write(f'\r{prefix} |{bar}| {iteration}/{total} ({percent}%) {suffix}')
+    sys.stdout.flush()
+
+# --- 3. 主程式 ---
+
+def main():
+    print("--- SPPB 批次測試啟動 (含 LLM 生成) ---")
+    connect_db()
     
     try:
-        response = ollama.chat(
-            model='gemma3:1b', # <-- 使用您電腦上的 gemma3:1b
-            messages=[
-                {'role': 'user', 'content': prompt_message},
-            ],
-            stream=False 
-        )
-        return response['message']['content']
+        # header=None 代表直接讀數據
+        df = pd.read_csv(CSV_FILE, header=None)
+    except Exception as e:
+        print(f"讀取輸入檔失敗: {e}")
+        return
+
+    total_cases = len(df)
+    results = []
+    
+    print(f"來源檔案: {CSV_FILE}")
+    print(f"總筆數: {total_cases} (每筆皆會呼叫 LLM，請稍候...)\n")
+
+    start_time = time.time()
+
+    for i, row in df.iterrows():
+        try:
+            # 1. 解析輸入 (欄位 0-4)
+            inputs = {
+                'bal_a': float(row[0]), 'bal_b': float(row[1]), 'bal_c': float(row[2]),
+                'gait': float(row[3]), 'chair': float(row[4])
+            }
+            
+            # 2. KG 運算
+            s_a = get_score_from_kg("並排站立", inputs['bal_a'])
+            s_b = get_score_from_kg("半並排站立", inputs['bal_b'])
+            s_c = get_score_from_kg("直線站立", inputs['bal_c'])
+            s_g = get_score_from_kg("步行速度", inputs['gait'])
+            s_ch = get_score_from_kg("椅子起站", inputs['chair'])
+            
+            act_total = s_a + s_b + s_c + s_g + s_ch
+            interp = get_interpretation(act_total)
+            
+            # 3. 準備 LLM 素材
+            facts = {
+                'bal_a_txt': get_meaning_from_kg("並排站立", s_a),
+                'bal_b_txt': get_meaning_from_kg("半並排站立", s_b),
+                'bal_c_txt': get_meaning_from_kg("直線站立", s_c),
+                'gait_txt': get_meaning_from_kg("步行速度", s_g),
+                'chair_txt': get_meaning_from_kg("椅子起站", s_ch),
+                'total_score': act_total,
+                'interp': interp
+            }
+            
+            # 4. 呼叫 LLM
+            llm_output = generate_llm_report(facts)
+            
+            # 5. 比對答案 (欄位 10 為總分)
+            expected_total = int(row[10])
+            status = "PASS" if act_total == expected_total else "FAIL"
+
+            # 6. 收集結果
+            # 將原始 row 轉 list，再加上我們算出的新資料
+            row_data = row.tolist()
+            row_data.extend([act_total, status, llm_output])
+            results.append(row_data)
+            
+            # 更新進度條
+            print_progress(i + 1, total_cases, prefix='進度:', suffix=f'目前狀態: {status}', length=40)
+
+        except Exception as e:
+            # 錯誤處理
+            err_row = row.tolist() + [0, "ERROR", str(e)]
+            results.append(err_row)
+            print_progress(i + 1, total_cases, prefix='進度:', suffix='Error!', length=40)
+
+    # 結束換行
+    sys.stdout.write('\n') 
+    
+    # --- 存檔 ---
+    cols = [
+        "In_BalA", "In_BalB", "In_BalC", "In_Gait", "In_Chair",
+        "Ans_BalA", "Ans_BalB", "Ans_BalC", "Ans_Gait", "Ans_Chair", "Ans_Total",
+        "實算總分", "驗證狀態", "LLM_生成報告"  # <--- 最後這一欄就是你要看的
+    ]
+    
+    try:
+        out_df = pd.DataFrame(results)
+        # 嘗試設定欄位名稱 (若欄位數相符)
+        if out_df.shape[1] == len(cols):
+            out_df.columns = cols
+        
+        out_df.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig')
+        
+        duration = time.time() - start_time
+        print("-" * 60)
+        print(f"完成！耗時 {duration:.1f} 秒")
+        print(f"檔案已輸出至: {OUTPUT_FILE}")
+        print("請直接打開 CSV 查看 'LLM_生成報告' 欄位。")
         
     except Exception as e:
-        print(f"\n[LLM 錯誤] 無法連接到 Ollama 伺服器: {e}", file=sys.stderr)
-        return None
+        print(f"存檔失敗: {e}")
 
-# --- 4. 應用程式主要邏輯 (V5) ---
-def main():
-    print("--- SPPB 智慧判讀系統 V5 (Graph-RAG) ---")
-    print("請輸入您在各項測試中測得的「原始秒數」。\n")
-    
-    kg_facts = {} # 我們用來儲存所有從 KG 檢索到的「事實」
-    
-    try:
-        connect_db() # 立即建立連線
-        
-        # --- 1. 平衡測試 (檢索分數 + 檢索事實) ---
-        print("--- 1. 平衡測試 (請輸入三項秒數) ---")
-        
-        time_side = float(input("  A. 並排站立 (秒): "))
-        score_side = get_score_from_kg("並排站立", time_side)
-        kg_facts['balance_side_meaning'] = get_meaning_from_kg("並排站立", score_side)
-        
-        time_semi = float(input("  B. 半並排站立 (秒): "))
-        score_semi = get_score_from_kg("半並排站立", time_semi)
-        kg_facts['balance_semi_meaning'] = get_meaning_from_kg("半並排站立", score_semi)
-        
-        time_tandem = float(input("  C. 直線站立 (秒): "))
-        score_tandem = get_score_from_kg("直線站立", time_tandem)
-        kg_facts['balance_tandem_meaning'] = get_meaning_from_kg("直線站立", score_tandem)
+    close_db()
 
-        balance_score_total = score_side + score_semi + score_tandem
-        print(f"\n[Python 運算] 平衡總分(加總): {balance_score_total} 分") 
-        
-        # --- 2. 步行速度 (檢索分數 + 檢索事實) ---
-        print("\n--- 2. 步行速度測試 ---")
-        time_gait = float(input("  B. 走四公尺的時間 (秒): "))
-        gait_score = get_score_from_kg("步行速度", time_gait)
-        kg_facts['gait_meaning'] = get_meaning_from_kg("步行速度", gait_score)
-
-        # --- 3. 椅子起站 (檢索分數 + 檢索事實) ---
-        print("\n--- 3. 椅子起站測試 ---")
-        time_chair = float(input("  C. 椅子起站五次 (秒): "))
-        chair_score = get_score_from_kg("椅子起站", time_chair)
-        kg_facts['chair_meaning'] = get_meaning_from_kg("椅子起站", chair_score)
-
-        # --- 4. 總分 (計算 + 檢索事實) ---
-        total_score = balance_score_total + gait_score + chair_score
-        kg_facts['total_score'] = total_score
-        print(f"\n[Python 運算] SPPB 總分是: {total_score} 分")
-
-        interpretation = get_sppb_interpretation(total_score)
-        kg_facts['interpretation'] = interpretation
-        
-        print(f"[KG 檢索完畢] 已收集所有事實，準備提交給 LLM...")
-
-        # --- 5. 呼叫 LLM 生成 (RAG) ---
-        llm_report = generate_llm_report(kg_facts)
-
-        if llm_report:
-            print("\n--- 您的 SPPB 總結報告 (KG-RAG 生成) ---")
-            print("=" * 40)
-            print(llm_report)
-            print("=" * 40)
-        else:
-            print("[錯誤] LLM 無法生成報告。")
-
-    except ValueError:
-        print("\n[錯誤] 請務必輸入數字。", file=sys.stderr)
-    except KeyboardInterrupt:
-        print("\n[操作中斷] 使用者取消操作。")
-    finally:
-        close_db_connection()
-        print("[KG 連線關閉。]")
-
-# --- 執行程式 ---
 if __name__ == "__main__":
-    main()  
+    main()
